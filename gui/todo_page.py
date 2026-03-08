@@ -1,4 +1,5 @@
-from db.todo_db_helper import insert_task, init_database, delete_task, get_all_tasks, update_task_status
+from db.todo_db_helper import insert_task, init_database, get_all_tasks, update_task_status
+from db.todo_db_helper import delete_task as db_delete_task
 from utils.extract_info import extract_info
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -778,9 +779,11 @@ class TodoList(QWidget):
         self.task_updated.emit()
         self.load_tasks()
 
+    # Updated Delete Task Function
+    
     def delete_task(self, task_id):
         """Delete a task from the database"""
-        delete_task(task_id)
+        db_delete_task(task_id)
         self.task_updated.emit()
         self.load_tasks()
     
