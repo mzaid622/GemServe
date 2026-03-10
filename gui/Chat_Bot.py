@@ -45,7 +45,7 @@ from services.file_service import (
 from utils.config import UPLOAD_DIR
 from utils.helpers import sanitize_filename
 from gui.Chat_Bot_styles import get_chat_styles
-
+from services.chat_service import detect_todo_intent, handle_todo_intent
 
 # ---------------------- MESSAGE BUBBLE -------------------------
 class MessageBubble(QFrame):
@@ -621,6 +621,23 @@ class ChatWindow(QWidget):
         self.add_message(text, True, save_to_db=True)
         self.input.clear()
 
+        # ----------- Zaid ---------------------------------
+        # TODO INTENT CHECK
+        
+        is_todo, task_text = detect_todo_intent(text)
+        if is_todo:
+            response = handle_todo_intent(task_text)
+            self.add_message(response, False, save_to_db=True)
+            self.input.setEnabled(True)
+            self.send_btn.setEnabled(True)
+            self.input.setFocus()
+            self.home_page_refresh()
+            return
+        # ---------- Zaid End ---------------------------------
+
+
+        # FILE OPERATION MODE
+        if self.file_operation_mode:
         # If mid-way through a file operation (e.g. waiting for "yes/no" or a number),
         # always route back to the file handler — never send to the LLM.
         if self.pending_file_action:
