@@ -644,7 +644,7 @@ class ChatWindow(QWidget):
         if self.file_operation_mode:
         # If mid-way through a file operation (e.g. waiting for "yes/no" or a number),
         # always route back to the file handler — never send to the LLM.
-        if self.pending_file_action:
+         if self.pending_file_action:
             self.handle_file_operation(text)
             self.input.setEnabled(True)
             self.send_btn.setEnabled(True)

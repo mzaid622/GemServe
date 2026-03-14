@@ -1,8 +1,12 @@
 # services/chat_service.py
 import json
 import os
+import re
+from datetime import datetime
+
 from db.database import get_session_messages, check_session_has_files
 from db.vector_store import query_relevant_chunks
+from db.todo_db_helper import insert_task, get_all_tasks
 from services.llm_service import (
     _call_ollama_chat,
     OLLAMA_FAST_MODEL,
@@ -14,13 +18,7 @@ from utils.config import (
     MAX_RAG_CHUNKS,
 )
 from utils.helpers import estimate_tokens
-from db.todo_db_helper import insert_task
 from utils.extract_info import extract_info
-from db.todo_db_helper import insert_task, get_all_tasks
-from datetime import datetime
-import json
-import os
-import re
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -71,7 +69,7 @@ def _get_user_notes() -> str | None:
 def build_messages_thinking(session_id: str, user_query: str) -> list:
     messages = []
 
-    # System
+    # System prompt
     system = _SYSTEM_THINKING
     name = _get_user_name()
     if name:
@@ -114,6 +112,8 @@ def build_messages_thinking(session_id: str, user_query: str) -> list:
 
 
 def build_messages_fast(session_id: str, user_query: str) -> list:
+    # FIX: was mixing two implementations (messages list + prompt_parts list)
+    # and referencing undefined variables. Rewritten to use messages list only.
     messages = []
 
     system = _SYSTEM_FAST
@@ -127,56 +127,62 @@ def build_messages_fast(session_id: str, user_query: str) -> list:
         messages.extend(_FAST_SEED)
     else:
         for role, content, _ in history:
-            prompt_parts.append(f"{role.capitalize()}: {content}")
-    
-    # 5. RAG Context (if files exist)
-    if has_files:
-        relevant_chunks = query_relevant_chunks(session_id, user_query, n_results=MAX_RAG_CHUNKS)
-        
-        if relevant_chunks and relevant_chunks['documents'][0]:
-            prompt_parts.append("\n--- Relevant Document Context ---")
-            for i, chunk in enumerate(relevant_chunks['documents'][0], 1):
-                metadata = relevant_chunks['metadatas'][0][i-1]
-                prompt_parts.append(f"\n[From {metadata['filename']}]")
-                prompt_parts.append(chunk)
-    
-    # 6. Current Query
-    prompt_parts.append(f"\n--- Current Query ---")
-    prompt_parts.append(f"User: {user_query}")
-    prompt_parts.append("Assistant:")
-    
-    final_prompt = "\n".join(prompt_parts)
-    
-    # Token estimation for debugging
-    total_tokens = estimate_tokens(final_prompt)
-    print(f"📊 Context tokens: ~{total_tokens}")
-    
-    return final_prompt
+            messages.append({"role": role, "content": content})
 
-def get_chat_response(session_id, user_query, mode="fast"):
-    """
-    Main function to get LLM response with full context
-    Args:
-        session_id: Chat session ID
-        user_query: User's current query
-        mode: "fast" (gemma3:270m) or "thinking" (gemma3n:e2b)
-    """
-    # Build context-aware prompt
-    prompt = build_context_prompt(session_id, user_query, mode=mode)
-    
-    # Get response from LLM with selected model
-    response = ask_ollama(prompt, mode=mode)
-    
-    return response
+    # RAG context (if files exist)
+    if check_session_has_files(session_id):
+        chunks = query_relevant_chunks(session_id, user_query, n_results=MAX_RAG_CHUNKS)
+        if chunks and chunks["documents"][0]:
+            rag_text = "\n\n".join(
+                f"[From {chunks['metadatas'][0][i]['filename']}]\n{chunk}"
+                for i, chunk in enumerate(chunks["documents"][0])
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Document context (use only if relevant):\n{rag_text}",
+                }
+            )
+
+    messages.append({"role": "user", "content": user_query})
+
+    print(
+        f"📊 Fast tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}"
+    )
+    return messages
 
 
+# ── Public API ────────────────────────────────────────────────────────────────
 
-# ------------------------------ ZAID -------------------------------------------------
-def detect_todo_intent(user_query):
+
+def get_chat_response(session_id: str, user_query: str, mode: str = "fast") -> str:
+    # FIX: was defined 3 times; last two called undefined `ask_ollama`. Single
+    # authoritative version kept, routing to the correct builder and model.
+    if mode == "thinking":
+        messages = build_messages_thinking(session_id, user_query)
+        model, timeout = OLLAMA_THINKING_MODEL, 180
+    else:
+        messages = build_messages_fast(session_id, user_query)
+        model, timeout = OLLAMA_FAST_MODEL, 60
+
+    return _call_ollama_chat(messages, model, timeout)
+
+
+# Backward-compat alias
+def build_context_prompt(session_id: str, user_query: str) -> str:
+    # FIX: was defined twice; second definition called undefined symbols.
+    messages = build_messages_thinking(session_id, user_query)
+    return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in messages)
+
+
+# ── Todo helpers ──────────────────────────────────────────────────────────────
+
+
+def detect_todo_intent(user_query: str):
     query_lower = user_query.lower().strip()
 
     todo_patterns = [
-        r'^yes add task\s+(.+)',       # Force add after duplicate warning
+        r'^yes add task\s+(.+)',
         r'^add task\s+(.+)',
         r'^add to(?: my)? (?:todo|to-do|task list)\s+(.+)',
         r'^remind me to\s+(.+)',
@@ -199,60 +205,56 @@ def detect_todo_intent(user_query):
     return False, None
 
 
-def validate_task_datetime(task_date, task_time):
+def validate_task_datetime(task_date: str, task_time: str):
     """
     Validate that task date/time is not in the past.
-    Returns (is_valid, error_message)
+    Returns (is_valid, error_message).
     """
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
 
-    # --- Validate Date ---
     try:
         task_date_obj = datetime.strptime(task_date, "%Y-%m-%d").date()
     except ValueError:
-        return False, f"❌ Invalid date format: '{task_date}'. Please use format like '2025-03-10' or say 'tomorrow'."
+        return False, (
+            f"❌ Invalid date format: '{task_date}'. "
+            "Please use format like '2025-03-10' or say 'tomorrow'."
+        )
 
     if task_date_obj < now.date():
         return False, (
             f"❌ Cannot add task in the past!\n\n"
             f"📅 You entered: {task_date}\n"
             f"📅 Today is: {today_str}\n\n"
-            f"Please provide a current or future date."
+            "Please provide a current or future date."
         )
 
-    # --- Validate Time (only if today) ---
     if task_date_obj == now.date() and task_time:
         try:
-            # Handle both "HH:MM" and "HH:MM AM/PM" formats
             task_time_clean = task_time.strip()
-
             if "am" in task_time_clean.lower() or "pm" in task_time_clean.lower():
                 task_time_obj = datetime.strptime(task_time_clean, "%I:%M %p").time()
             else:
                 task_time_obj = datetime.strptime(task_time_clean, "%H:%M").time()
 
-            # Compare with current time
             if task_time_obj < now.time():
                 current_time_str = now.strftime("%I:%M %p")
                 return False, (
                     f"❌ Cannot add task in the past!\n\n"
                     f"⏰ You entered: {task_time}\n"
                     f"⏰ Current time: {current_time_str}\n\n"
-                    f"Please provide a future time for today, or specify a future date."
+                    "Please provide a future time for today, or specify a future date."
                 )
-
         except ValueError:
-            # If time parsing fails, skip time validation (dont block user)
-            pass
+            pass  # Skip time validation if parsing fails
 
     return True, None
 
 
-def handle_todo_intent(task_text):
+def handle_todo_intent(task_text: str) -> str:
     """
-    Extract info, validate datetime, check duplicate, and insert task into DB.
-    Returns confirmation message string.
+    Extract info, validate datetime, check for duplicates, and insert task into DB.
+    Returns a confirmation message string.
     """
     title, task_date, task_time = extract_info(task_text)
 
@@ -265,19 +267,16 @@ def handle_todo_intent(task_text):
             "  • 'todo finish report'"
         )
 
-    # --- Validate date/time ---
     is_valid, error_msg = validate_task_datetime(task_date, task_time)
     if not is_valid:
         return error_msg
 
-    # --- Duplicate Check ---
     existing_tasks = get_all_tasks()
     for task in existing_tasks:
         existing_title = str(task[1]).lower().strip()
         existing_date = str(task[2]).strip()
 
         if existing_title == title.lower().strip() and existing_date == task_date:
-            time_str = f" at {task_time}" if task_time else ""
             return (
                 f"⚠️ Task already exists!\n\n"
                 f"📝 Title: {task[1]}\n"
@@ -286,13 +285,8 @@ def handle_todo_intent(task_text):
                 f"Add anyway? Type 'yes add task {task_text}' to force add."
             )
 
-    # --- Force add check ---
-    # (handled in detect_todo_intent via "yes add task" prefix)
-
-    # --- Insert into DB ---
     try:
         insert_task(title, task_date, task_time)
-
         time_str = f"{task_time}" if task_time else "(no time set)"
         return (
             f"✅ Task added to your Todo List!\n\n"
@@ -302,111 +296,3 @@ def handle_todo_intent(task_text):
         )
     except Exception as e:
         return f"❌ Failed to add task: {str(e)}"
-
-
-def build_context_prompt(session_id, user_query, mode="fast"):
-    """
-    Build complete context prompt for LLM
-    Includes: system prompt + user prefs + chat history + RAG context + current query
-    """
-    prompt_parts = []
-
-    # 1. System Prompt
-    prompt_parts.append(SYSTEM_PROMPT)
-
-    # 2. User Preferences & Personalization
-    user_data_file = "user_data.json"
-    user_notes_file = "user_notes.json"
-
-    if os.path.exists(user_data_file):
-        with open(user_data_file, 'r') as f:
-            user_data = json.load(f)
-            if user_data.get("name"):
-                prompt_parts.append(f"\nUser's name: {user_data['name']}")
-
-    if os.path.exists(user_notes_file):
-        with open(user_notes_file, 'r') as f:
-            user_notes = json.load(f)
-            notes_content = user_notes.get("notes", "").strip()
-            if notes_content:
-                prompt_parts.append("\n--- User Personalization Notes ---")
-                prompt_parts.append(notes_content)
-                prompt_parts.append("(Use this information to personalize responses.)")
-
-    # 3. Check if session has files
-    has_files = check_session_has_files(session_id)
-
-    # 4. Chat History
-    if mode == "thinking":
-        history_limit = THINKING_MODE_HISTORY_MESSAGES_WITH_FILES if has_files else THINKING_MODE_HISTORY_MESSAGES_NO_FILES
-    else:
-        history_limit = FAST_MODE_HISTORY_MESSAGES_NO_FILES if not has_files else FAST_MODE_HISTORY_MESSAGES_WITH_FILES
-
-    history = get_session_messages(session_id, limit=history_limit)
-
-    if history:
-        prompt_parts.append("\n--- Previous Conversation ---")
-        for role, content, _ in history:
-            prompt_parts.append(f"{role.capitalize()}: {content}")
-
-    # 5. RAG Context
-    if has_files:
-        relevant_chunks = query_relevant_chunks(session_id, user_query, n_results=MAX_RAG_CHUNKS)
-
-        if relevant_chunks and relevant_chunks['documents'][0]:
-            prompt_parts.append("\n--- Relevant Document Context ---")
-            for i, chunk in enumerate(relevant_chunks['documents'][0], 1):
-                metadata = relevant_chunks['metadatas'][0][i-1]
-                prompt_parts.append(f"\n[From {metadata['filename']}]")
-                prompt_parts.append(chunk)
-
-    # 6. Current Query
-    prompt_parts.append(f"\n--- Current Query ---")
-    prompt_parts.append(f"User: {user_query}")
-    prompt_parts.append("Assistant:")
-
-    final_prompt = "\n".join(prompt_parts)
-    total_tokens = estimate_tokens(final_prompt)
-    print(f"📊 Context tokens: ~{total_tokens}")
-
-    return final_prompt
-
-
-def get_chat_response(session_id, user_query, mode="fast"):
-    """
-    Main function to get LLM response with full context
-    """
-    prompt = build_context_prompt(session_id, user_query, mode=mode)
-    response = ask_ollama(prompt, mode=mode)
-    return response
-
-
-# ------------------------------ ZAID END -------------------------------------------------
-            messages.append({"role": role, "content": content})
-
-    messages.append({"role": "user", "content": user_query})
-
-    print(
-        f"📊 Fast tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}"
-    )
-    return messages
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-
-def get_chat_response(session_id, user_query: str, mode: str = "fast") -> str:
-    if mode == "thinking":
-        messages = build_messages_thinking(session_id, user_query)
-        model, timeout = OLLAMA_THINKING_MODEL, 180
-    else:
-        messages = build_messages_fast(session_id, user_query)
-        model, timeout = OLLAMA_FAST_MODEL, 60
-
-    return _call_ollama_chat(messages, model, timeout)
-
-
-# Backward-compat alias
-def build_context_prompt(session_id, user_query: str) -> str:
-    messages = build_messages_thinking(session_id, user_query)
-    return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in messages)
