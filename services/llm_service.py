@@ -69,6 +69,24 @@ def _call_ollama(prompt: str, model: str, timeout: int = 60, retries: int = 2) -
 
     return _FALLBACK
 
+# def _call_ollama(prompt: str, model: str, timeout: int = 15) -> str:
+#     """
+#     Internal helper for quick single-shot LLM calls.
+#     Used by system_intent_service for intent parsing.
+#     """
+#     url = f"{OLLAMA_BASE_URL}/api/generate"
+#     data = {
+#         "model": model,
+#         "prompt": prompt,
+#         "stream": False
+#     }
+#     try:
+#         response = requests.post(url, json=data, timeout=timeout)
+#         response.raise_for_status()
+#         result = response.json()
+#         return result.get("response", "").strip()
+#     except Exception as e:
+#         raise Exception(f"Ollama call failed: {str(e)}")
 
 def ask_ollama(prompt: str) -> str:
     """Send a plain prompt using the fast model. Used by file intent parsing."""
