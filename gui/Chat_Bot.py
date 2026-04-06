@@ -1,5 +1,6 @@
 # gui/Chat_Bot.py
 import sys, os
+from services.system_intent_service import handle_system_command, is_system_command
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -55,7 +56,6 @@ class MessageBubble(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # Clean up text - remove leading/trailing whitespace and extra newlines
         cleaned_text = text.strip()
 
         bubble = QLabel(cleaned_text)
@@ -180,12 +180,12 @@ class LLMWorker(QThread):
 
 # ---------------------- FILE PROCESSOR WORKER THREAD -------------------------
 class FileProcessorWorker(QThread):
-    """Background thread for file processing (extraction, chunking, embedding) to keep UI responsive"""
+    """Background thread for file processing"""
 
-    progress = Signal(int)  # Emits percentage (0-100)
-    status_update = Signal(str)  # Emits status message
-    finished = Signal(bool)  # Emits success status
-    error = Signal(str)  # Emits error message
+    progress = Signal(int)
+    status_update = Signal(str)
+    finished = Signal(bool)
+    error = Signal(str)
 
     def __init__(self, session_id, file_path, file_type, filename):
         super().__init__()
@@ -196,55 +196,49 @@ class FileProcessorWorker(QThread):
 
     def run(self):
         try:
-            # Step 1: Save file metadata
             self.status_update.emit(f"📎 Processing: {self.filename}...")
             self.progress.emit(10)
-            
+
             file_id = save_file_metadata(
                 self.session_id, self.filename, self.file_path, self.file_type
             )
-            
-            # Step 2: Extract text from file
+
             self.status_update.emit(f"📖 Extracting text from {self.filename}...")
             self.progress.emit(20)
             chunks = process_file(self.file_path, self.file_type)
-            
+
             if not chunks:
                 self.error.emit(f"⚠️ Could not extract text from {self.filename}")
                 self.finished.emit(False)
                 return
-            
-            # Step 3: Generate embeddings with progress tracking
+
             self.status_update.emit(f"🔄 Generating embeddings for {len(chunks)} chunks...")
             self.progress.emit(30)
-            
-            # Define progress callback for embedding generation
+
             def embedding_progress(current, total):
-                # Map 30-90% to embedding generation progress
                 percent = 30 + int((current / total) * 60)
                 self.progress.emit(percent)
-            
+
             success = add_document_chunks(
-                self.session_id, 
-                file_id, 
-                self.filename, 
+                self.session_id,
+                file_id,
+                self.filename,
                 chunks,
                 progress_callback=embedding_progress
             )
-            
+
             if not success:
                 self.error.emit(f"❌ Failed to process embeddings for {self.filename}")
                 self.finished.emit(False)
                 return
-            
-            # Step 4: Mark file as processed
+
             self.status_update.emit(f"✅ Finalizing...")
             self.progress.emit(95)
             mark_file_processed(file_id)
-            
+
             self.progress.emit(100)
             self.finished.emit(True)
-            
+
         except Exception as e:
             self.error.emit(f"❌ File processing error: {str(e)}")
             self.finished.emit(False)
@@ -255,10 +249,6 @@ class RouterWorker(QThread):
     """
     Runs is_file_operation_request() in a background thread so the LLM
     routing call never freezes the UI.
-
-    Emits:
-        finished(bool) — True if message is a file operation, False for chat
-        error(str)     — on exception (caller should default to chat)
     """
     finished = Signal(bool)
     error    = Signal(str)
@@ -289,14 +279,12 @@ class ChatWindow(QWidget):
         self.current_session_id = None
         self.is_new_session = True
         self.llm_worker = None
-        self.file_worker = None  # File processor worker
+        self.file_worker = None
         self._speech_popup = None
-        self.llm_worker    = None
         self.router_worker = None
-        
-        # File operation mode state
+
         self.file_operation_mode = False
-        self.pending_file_action = None  # Store pending actions (delete, overwrite, create location, etc.)
+        self.pending_file_action = None
 
         self.setMinimumSize(450, 620)
         self.setup_ui()
@@ -458,7 +446,7 @@ class ChatWindow(QWidget):
         self.title.setText("New Chat")
         self.clear_chat()
         self.files_container.setVisible(False)
-        self.mode_combo.setCurrentIndex(0)  # Reset to Fast mode
+        self.mode_combo.setCurrentIndex(0)
         print("✅ Ready for new session")
 
     def load_session(self, session_id):
@@ -517,9 +505,7 @@ class ChatWindow(QWidget):
     # ---------------- FILE OPERATION HANDLER ----------------
     def handle_file_operation(self, text):
         """Handle file operation commands using LLM for intent recognition"""
-        # Check if this is a response to a pending action
         if self.pending_file_action:
-            pending_state = self.pending_file_action.get("state", "select")
             result = process_file_response(text, self.pending_file_action)
 
             if result["status"] == "success":
@@ -527,8 +513,6 @@ class ChatWindow(QWidget):
                 self.pending_file_action = None
 
             elif result["status"] == "confirm":
-                # Need confirmation before proceeding
-                # Handle both {"file": x} (from select flow) and {"files": [x]} (from direct match)
                 data = result.get("data", {})
                 file_to_delete = (
                     data.get("file") or
@@ -542,7 +526,6 @@ class ChatWindow(QWidget):
                 self.add_message(result["message"], False, save_to_db=False)
 
             elif result["status"] == "ask_location":
-                # Ask for custom path
                 self.pending_file_action = {
                     "state": "location",
                     "filename": self.pending_file_action.get("filename"),
@@ -563,7 +546,6 @@ class ChatWindow(QWidget):
 
             return
 
-        # Process new file command using LLM
         result = handle_llm_file_command(text, self.current_session_id)
 
         if result["status"] == "success":
@@ -573,11 +555,9 @@ class ChatWindow(QWidget):
             self.add_message(result["message"], False, save_to_db=False)
 
         elif result["status"] == "clarify":
-            # LLM wasn't confident about intent
             self.add_message(result["message"], False, save_to_db=False)
 
         elif result["status"] == "select":
-            # Multiple files found, ask user to select
             self.pending_file_action = {
                 "state": "select",
                 "files": result["data"]["files"],
@@ -587,7 +567,6 @@ class ChatWindow(QWidget):
             self.add_message(result["message"], False, save_to_db=False)
 
         elif result["status"] == "confirm":
-            # Confirmation required before proceeding
             self.pending_file_action = {
                 "state": "delete_confirm",
                 "file": result["data"]["files"][0] if result["data"]["files"] else None,
@@ -596,7 +575,6 @@ class ChatWindow(QWidget):
             self.add_message(result["message"], False, save_to_db=False)
 
         elif result["status"] == "ask_location":
-            # Ask where to create file
             self.pending_file_action = {
                 "state": "location",
                 "filename": result["data"]["filename"],
@@ -616,18 +594,16 @@ class ChatWindow(QWidget):
         if self.is_new_session:
             self.current_session_id = create_session(text)
             self.is_new_session = False
-
             title = text[:30] + "..." if len(text) > 30 else text
             self.title.setText(title)
-
             self.home_page_refresh()
 
         self.add_message(text, True, save_to_db=True)
         self.input.clear()
 
-        # ----------- Zaid ---------------------------------
-        # TODO INTENT CHECK
-        
+        # ─────────────────────────────────────────────
+        # 1. TODO INTENT CHECK
+        # ─────────────────────────────────────────────
         is_todo, task_text = detect_todo_intent(text)
         if is_todo:
             response = handle_todo_intent(task_text)
@@ -637,8 +613,18 @@ class ChatWindow(QWidget):
             self.input.setFocus()
             self.home_page_refresh()
             return
-        # ---------- Zaid End ---------------------------------
 
+        # ─────────────────────────────────────────────
+        # 2. SYSTEM COMMAND CHECK
+        # ─────────────────────────────────────────────
+        if is_system_command(text):
+            result = handle_system_command(text)
+            if result["status"] != "none":
+                self.add_message(result["message"], False, save_to_db=True)
+                self.input.setEnabled(True)
+                self.send_btn.setEnabled(True)
+                self.input.setFocus()
+                return
         # ✅ APP CONTROL — open app / close app / switch app
         app_response = handle_app_command(text)
         if app_response:
@@ -648,24 +634,31 @@ class ChatWindow(QWidget):
             self.input.setFocus()
             return
 
-        # FILE OPERATION MODE
+        # ─────────────────────────────────────────────
+        # 3. FILE OPERATION MODE
+        # If mid-way through a file operation always route back to file handler
+        # ─────────────────────────────────────────────
         if self.file_operation_mode:
-        # If mid-way through a file operation (e.g. waiting for "yes/no" or a number),
-        # always route back to the file handler — never send to the LLM.
-         if self.pending_file_action:
-            self.handle_file_operation(text)
-            self.input.setEnabled(True)
-            self.send_btn.setEnabled(True)
-            self.input.setFocus()
-            return
+            if self.pending_file_action:
+                self.handle_file_operation(text)
+                self.input.setEnabled(True)
+                self.send_btn.setEnabled(True)
+                self.input.setFocus()
+                return
 
+        # ─────────────────────────────────────────────
+        # 4. ROUTE via LLM (file op vs normal chat)
+        # ─────────────────────────────────────────────
         mode = self.get_selected_mode()
 
-        # Route via LLM using the currently selected model
         self.add_message("🔍 Routing...", False, save_to_db=False)
         self.router_worker = RouterWorker(text, mode)
-        self.router_worker.finished.connect(lambda is_file: self._after_routing(text, mode, is_file))
-        self.router_worker.error.connect(lambda _: self._after_routing(text, mode, False))
+        self.router_worker.finished.connect(
+            lambda is_file: self._after_routing(text, mode, is_file)
+        )
+        self.router_worker.error.connect(
+            lambda _: self._after_routing(text, mode, False)
+        )
         self.router_worker.start()
 
     def _after_routing(self, text: str, mode: str, is_file_op: bool):
@@ -692,7 +685,7 @@ class ChatWindow(QWidget):
     def process_text_input(self, text: str):
         """
         Central entry point for any text input — typed OR spoken.
-        Voice just calls this after speech-to-text; zero extra routing needed.
+        Voice just calls this after speech-to-text.
         """
         self.input.setText(text)
         self.on_send()
@@ -731,19 +724,8 @@ class ChatWindow(QWidget):
 
     def _on_voice_text(self, text: str):
         self.input.setText(text)
-        """
-        Voice input handler.
-        When speech-to-text is added, replace the body with:
-
-            text = speech_to_text()        # e.g. using whisper / vosk
-            if text:
-                self.process_text_input(text)
-
-        process_text_input() routes through the same LLM router as
-        typed messages, so file ops and chat both work with zero extra code.
-        """
         self.add_message(
-            "🎤 Voice input coming soon!"
+            "🎤 Voice input coming soon! "
             "When ready, speech will route through the same pipeline as typed messages.",
             False, save_to_db=False
         )
@@ -768,12 +750,10 @@ class ChatWindow(QWidget):
             return
 
         filename = os.path.basename(file_path)
-        
-        # Disable buttons during upload
+
         self.file_btn.setEnabled(False)
         self.send_btn.setEnabled(False)
-        
-        # Add initial message
+
         self.add_message(f"📎 Uploading: {filename}...", False, save_to_db=False)
 
         try:
@@ -784,12 +764,11 @@ class ChatWindow(QWidget):
             shutil.copy(file_path, dest_path)
 
             file_type = safe_filename.split(".")[-1].lower()
-            
-            # Start file processor worker in background
+
             self.file_worker = FileProcessorWorker(
-                self.current_session_id, 
-                dest_path, 
-                file_type, 
+                self.current_session_id,
+                dest_path,
+                file_type,
                 filename
             )
             self.file_worker.progress.connect(self.on_file_progress)
@@ -804,66 +783,46 @@ class ChatWindow(QWidget):
             self.send_btn.setEnabled(True)
 
     def on_file_progress(self, percent):
-        """Update progress bar percentage"""
-        # Update the last message with progress
-        if self.chat_layout.count() > 1:
-            last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
-            if last_item and last_item.widget():
-                # Extract filename from current message
-                bubble = last_item.widget()
-                # We'll update via status instead to avoid complex message parsing
-                pass
+        pass
 
     def on_file_status_update(self, status):
-        """Update status message during file processing"""
-        # Replace the previous status message
         if self.chat_layout.count() > 1:
             last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
             if last_item and last_item.widget():
                 last_item.widget().deleteLater()
-        
         self.add_message(status, False, save_to_db=False)
 
     def on_file_upload_finished(self, success):
-        """Handle file upload completion"""
-        # Remove the "Finalizing..." message
         if self.chat_layout.count() > 1:
             last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
             if last_item and last_item.widget():
                 last_item.widget().deleteLater()
-        
+
         if success:
-            # Show final success message
             self.add_message(
                 f"✅ File uploaded successfully!\nFile is ready for questions.",
                 False,
                 save_to_db=False,
             )
-            # Refresh the files UI
             self.load_uploaded_files_ui()
-        
-        # Re-enable buttons
+
         self.file_btn.setEnabled(True)
         self.send_btn.setEnabled(True)
         self.input.setFocus()
 
     def on_file_upload_error(self, error_msg):
-        """Handle file upload error"""
-        # Remove the processing message
         if self.chat_layout.count() > 1:
             last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
             if last_item and last_item.widget():
                 last_item.widget().deleteLater()
-        
+
         self.add_message(error_msg, False, save_to_db=False)
-        
-        # Re-enable buttons
+
         self.file_btn.setEnabled(True)
         self.send_btn.setEnabled(True)
         self.input.setFocus()
 
     def add_file_to_ui(self, filename):
-        """Add file badge to the files container"""
         file_badge = QLabel(f"📄 {filename}")
         file_badge.setObjectName("fileBadge")
         file_badge.setFixedHeight(32)
@@ -871,7 +830,6 @@ class ChatWindow(QWidget):
         self.files_container.setVisible(True)
 
     def load_uploaded_files_ui(self):
-        """Load uploaded files for current session into UI"""
         if not self.current_session_id:
             return
 
