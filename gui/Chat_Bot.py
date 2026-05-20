@@ -605,7 +605,66 @@ class ChatWindow(QWidget):
 
         self.add_message(text, True, save_to_db=True)
         self.input.clear()
+        # ---------------------------
+        print(">>> pending_file_action =", self.pending_file_action)
+        # ADD THIS HERE
+        if self.pending_file_action and self.pending_file_action.get("action") in (
+        "rename", "move", "search_location"):
+            print(">>> ROUTING TO ADVANCED FILE HANDLER")
+            self._handle_advanced_file(text)
+            return
 
+        # ---------------------------
+        if self.pending_file_action:
+            action = self.pending_file_action.get("action")
+            state = self.pending_file_action.get("state", "")
+
+            if action == "create_file" and state == "need_save_location":
+                choice = text.strip()
+                user_profile = os.environ.get("USERPROFILE", "")
+                location_map = {
+                    "1": os.path.join(user_profile, "Desktop"),
+                    "2": os.path.join(user_profile, "Documents"),
+                    "3": os.path.join(user_profile, "Downloads"),
+                }
+                if choice in location_map:
+                    save_location = location_map[choice]
+                else:
+                    save_location = choice
+
+                pending = self.pending_file_action
+
+                from services.file_creator_service import (
+                    create_csv,
+                    create_xlsx,
+                    create_docx,
+                    create_pdf,
+                )
+
+                file_type = pending.get("file_type")
+                filename = pending.get("filename")
+                headers = pending.get("headers", [])
+                rows = pending.get("rows", [])
+                content = pending.get("content")
+                title = pending.get("title")
+
+                if file_type == "csv":
+                    result = create_csv(filename, headers, rows, save_location)
+                elif file_type == "xlsx":
+                    result = create_xlsx(filename, headers, rows, title, save_location)
+                elif file_type == "docx":
+                    result = create_docx(filename, content, title, headers, rows, save_location)
+                elif file_type == "pdf":
+                    result = create_pdf(filename, content, title, headers, rows, save_location)
+                else:
+                    result = {"status": "error", "message": f"❌ Unsupported file type: {file_type}"}
+
+                self.add_message(result["message"], False, save_to_db=False)
+                self.pending_file_action = None
+                self._re_enable()
+                return
+        # ---------------------------
+        
         # ─────────────────────────────────────────────
         # 1. TODO INTENT CHECK
         # ─────────────────────────────────────────────
@@ -1216,6 +1275,9 @@ class ChatWindow(QWidget):
 
             data = result.get("data", {})
             found_files = data.get("files", [])
+
+            print(">>> found_files:", found_files)  # ADD THIS
+            print(">>> data:", data)                # ADD THIS
 
             if found_files:
                 self.pending_file_action = {
